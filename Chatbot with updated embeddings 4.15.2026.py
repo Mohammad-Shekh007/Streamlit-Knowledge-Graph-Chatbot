@@ -1,14 +1,15 @@
+import json
 import re
 import streamlit as st
 from neo4j import GraphDatabase
 from openai import OpenAI
 
 # --- 1. CONFIGURATION ---
-# This tells the app: "Go get the values I saved in the Streamlit vault"
 OPENAI_KEY = st.secrets["OPENAI_KEY"]
 NEO4J_URI = st.secrets["NEO4J_URI"]
 NEO4J_USER = st.secrets["NEO4J_USER"]
 NEO4J_PWD = st.secrets["NEO4J_PWD"]
+NEO4J_DATABASE = "neo4j"
 
 client = OpenAI(api_key=OPENAI_KEY)
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PWD))
@@ -47,10 +48,6 @@ def format_value_unit(val, unit):
 
 
 def deduplicate_facts(facts):
-    """
-    Deduplicate near-identical facts.
-    Keeps the first good version.
-    """
     seen = set()
     clean = []
 
@@ -70,6 +67,13 @@ def deduplicate_facts(facts):
             clean.append(f)
 
     return clean
+
+
+def format_path_record(p):
+    return (
+        f"PATH: {p['n1']} -[{p['r1']}]-> {p['n2']} "
+        f"-[{p['r2']}]-> {p['n3']}"
+    )
 
 
 # --- 3. QUERY TYPE DETECTION ---
@@ -190,8 +194,9 @@ def expand_query(user_query: str):
 def search_graph_once(user_query, node_threshold=0.25, rel_threshold=0.20, top_k_nodes=8, top_k_rels=8):
     query_emb = get_embedding(user_query)
     fact_pool = []
+    anchors = []
 
-    with driver.session() as session:
+    with driver.session(database=NEO4J_DATABASE) as session:
         node_results = session.run("""
             CALL db.index.vector.queryNodes('node_index', $top_k, $emb)
             YIELD node, score
@@ -206,7 +211,7 @@ def search_graph_once(user_query, node_threshold=0.25, rel_threshold=0.20, top_k
         print(f"📍 ANCHORS: {anchors}")
 
         if not anchors:
-            return []
+            return [], []
 
         rel_types_res = session.run("CALL db.relationshipTypes()")
         all_types = [r["relationshipType"] for r in rel_types_res]
@@ -228,6 +233,8 @@ def search_graph_once(user_query, node_threshold=0.25, rel_threshold=0.20, top_k
                     relationship.unit AS unit,
                     relationship.date AS date,
                     relationship.period AS period,
+                    relationship.location AS location,
+                    relationship.condition AS condition,
                     score AS score
             """
 
@@ -245,10 +252,19 @@ def search_graph_once(user_query, node_threshold=0.25, rel_threshold=0.20, top_k
                     time_parts = [p for p in [f["period"], f["date"]] if p]
                     time_info = " | ".join(time_parts) if time_parts else "N/A"
 
+                    extras = []
+                    if f["location"]:
+                        extras.append(f"Location: {f['location']}")
+                    if f["condition"]:
+                        extras.append(f"Condition: {f['condition']}")
+
+                    extra_text = f" | {' | '.join(extras)}" if extras else ""
+
                     fact_line = (
                         f"FACT: {f['sub']} {f['rel']} {f['obj']} "
                         f"| Value: {val_str} "
-                        f"| Time: {time_info} "
+                        f"| Time: {time_info}"
+                        f"{extra_text} "
                         f"| Score: {round(f['score'], 4)}"
                     )
                     fact_pool.append(fact_line)
@@ -257,10 +273,31 @@ def search_graph_once(user_query, node_threshold=0.25, rel_threshold=0.20, top_k
                 print(f"⚠️ Relationship search failed for {idx_name}: {e}")
                 continue
 
-    return deduplicate_facts(fact_pool)
+    return deduplicate_facts(fact_pool), anchors
 
 
-# --- 7. FACT RERANKING ---
+# --- 7. GRAPH TRAVERSAL REASONING ---
+def get_reasoning_paths(anchor_names, limit=50):
+    if not anchor_names:
+        return []
+
+    with driver.session(database=NEO4J_DATABASE) as session:
+        result = session.run("""
+            MATCH path = (a:Entity)-[r1]->(b:Entity)-[r2]->(c:Entity)
+            WHERE a.name IN $anchors OR b.name IN $anchors OR c.name IN $anchors
+            RETURN
+                a.name AS n1,
+                type(r1) AS r1,
+                b.name AS n2,
+                type(r2) AS r2,
+                c.name AS n3
+            LIMIT $limit
+        """, anchors=anchor_names, limit=limit)
+
+        return [dict(r) for r in result]
+
+
+# --- 8. FACT / PATH RERANKING ---
 def rerank_facts(user_query: str, facts: list[str], keep_top_n: int = 8):
     try:
         numbered_facts = "\n".join([f"{i+1}. {fact}" for i, fact in enumerate(facts)])
@@ -302,7 +339,73 @@ def rerank_facts(user_query: str, facts: list[str], keep_top_n: int = 8):
         return deduplicate_facts(facts[:keep_top_n])
 
 
-# --- 8. NORMAL GRAPH RAG FLOW ---
+def rerank_facts_and_paths(user_query: str, facts: list[str], paths: list[str],
+                           keep_top_facts: int = 8, keep_top_paths: int = 6):
+    try:
+        numbered_facts = "\n".join([f"F{i+1}. {fact}" for i, fact in enumerate(facts)])
+        numbered_paths = "\n".join([f"P{i+1}. {path}" for i, path in enumerate(paths)])
+
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are ranking financial graph evidence for relevance.\n"
+                        "The evidence includes:\n"
+                        "- FACTS = grounded triples\n"
+                        "- PATHS = multi-hop graph traversal chains\n\n"
+                        "If the question asks about causes, drivers, sequences, how, why, "
+                        "or relationships between entities, PATHS are especially important.\n"
+                        "Return only valid JSON."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"QUESTION:\n{user_query}\n\n"
+                        f"FACTS:\n{numbered_facts}\n\n"
+                        f"PATHS:\n{numbered_paths}\n\n"
+                        "Return JSON in this format:\n"
+                        "{\n"
+                        '  "facts": [1,2,3],\n'
+                        '  "paths": [1,2]\n'
+                        "}\n"
+                        f"Select at most {keep_top_facts} facts and {keep_top_paths} paths."
+                    )
+                }
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        raw = json.loads(completion.choices[0].message.content)
+
+        selected_facts = []
+        selected_paths = []
+
+        for idx in raw.get("facts", []):
+            if isinstance(idx, int) and 1 <= idx <= len(facts):
+                selected_facts.append(facts[idx - 1])
+
+        for idx in raw.get("paths", []):
+            if isinstance(idx, int) and 1 <= idx <= len(paths):
+                selected_paths.append(paths[idx - 1])
+
+        if not selected_facts:
+            selected_facts = facts[:keep_top_facts]
+
+        if not selected_paths:
+            selected_paths = paths[:keep_top_paths]
+
+        return deduplicate_facts(selected_facts), deduplicate_facts(selected_paths)
+
+    except Exception as e:
+        print(f"⚠️ Fact/path reranking failed: {e}")
+        return deduplicate_facts(facts[:keep_top_facts]), deduplicate_facts(paths[:keep_top_paths])
+
+
+# --- 9. GRAPH RAG FLOW WITH TRAVERSAL ---
 def get_grounded_context(user_query):
     rewritten = rewrite_query(user_query)
     expanded_queries = expand_query(rewritten)
@@ -311,21 +414,39 @@ def get_grounded_context(user_query):
     print(f"🧠 EXPANDED QUERIES: {expanded_queries}")
 
     all_facts = []
+    all_anchor_names = []
 
     for q in expanded_queries:
-        facts = search_graph_once(q)
+        facts, anchors = search_graph_once(q)
         all_facts.extend(facts)
+        all_anchor_names.extend(anchors)
 
     all_facts = deduplicate_facts(all_facts)
+    all_anchor_names = list(dict.fromkeys(all_anchor_names))[:20]
 
-    if not all_facts:
-        return None, rewritten, expanded_queries
+    if not all_facts and not all_anchor_names:
+        return None, rewritten, expanded_queries, [], []
 
-    reranked_facts = rerank_facts(user_query, all_facts)
-    return "\n".join(reranked_facts), rewritten, expanded_queries
+    raw_paths = get_reasoning_paths(all_anchor_names)
+    path_lines = [format_path_record(p) for p in raw_paths]
+    path_lines = deduplicate_facts(path_lines)
+
+    reranked_facts, reranked_paths = rerank_facts_and_paths(
+        user_query,
+        all_facts,
+        path_lines
+    )
+
+    combined_context = ""
+    if reranked_facts:
+        combined_context += "FACT CONTEXT:\n" + "\n".join(reranked_facts) + "\n\n"
+    if reranked_paths:
+        combined_context += "PATH CONTEXT:\n" + "\n".join(reranked_paths)
+
+    return combined_context.strip(), rewritten, expanded_queries, reranked_facts, reranked_paths
 
 
-# --- 9. GRAPH REASONING MODE ---
+# --- 10. GRAPH REASONING MODE (NUMERIC) ---
 def run_reasoning_query(user_query: str):
     metric_ref = detect_metric_reference(user_query)
     year = detect_year(user_query)
@@ -345,7 +466,7 @@ def run_reasoning_query(user_query: str):
 
 
 def reasoning_greater_than(reference_metric: str, year: str):
-    with driver.session() as session:
+    with driver.session(database=NEO4J_DATABASE) as session:
         ref_query = """
         MATCH (s:Entity)-[r]->(o:Entity)
         WHERE toLower(o.name) CONTAINS toLower($metric)
@@ -435,7 +556,7 @@ def reasoning_greater_than(reference_metric: str, year: str):
 
 
 def reasoning_less_than(reference_metric: str, year: str):
-    with driver.session() as session:
+    with driver.session(database=NEO4J_DATABASE) as session:
         ref_query = """
         MATCH (s:Entity)-[r]->(o:Entity)
         WHERE toLower(o.name) CONTAINS toLower($metric)
@@ -524,7 +645,7 @@ def reasoning_less_than(reference_metric: str, year: str):
         }
 
 
-# --- 10. DRIVER ANALYSIS MODE ---
+# --- 11. DRIVER ANALYSIS MODE ---
 def run_driver_analysis(user_query: str):
     metric_ref = detect_metric_reference(user_query)
     year = detect_year(user_query)
@@ -532,7 +653,7 @@ def run_driver_analysis(user_query: str):
     if not metric_ref:
         return None
 
-    with driver.session() as session:
+    with driver.session(database=NEO4J_DATABASE) as session:
         query = """
         MATCH (s:Entity)-[r]->(o:Entity)
         WHERE r.value IS NOT NULL
@@ -554,14 +675,12 @@ def run_driver_analysis(user_query: str):
             if metric_value is None:
                 continue
 
-            # exclude the target metric itself
             if metric_ref.lower() in metric_name.lower():
                 continue
 
             rel_name = str(row["rel"]).lower()
             name_lower = str(metric_name).lower()
 
-            # keep finance-style likely drivers
             good_terms = [
                 "income", "sales", "margin", "earnings", "expense",
                 "tax", "comprehensive", "operating"
@@ -632,7 +751,7 @@ def write_driver_answer(user_query: str, driver_result: dict):
         return f"Driver answer generation failed: {e}"
 
 
-# --- 11. LLM WRITER FOR REASONING RESULTS ---
+# --- 12. LLM WRITER FOR REASONING RESULTS ---
 def write_reasoning_answer(user_query: str, reasoning_result: dict):
     if not reasoning_result["success"]:
         return reasoning_result["message"]
@@ -678,7 +797,40 @@ def write_reasoning_answer(user_query: str, reasoning_result: dict):
         return f"Reasoning answer generation failed: {e}"
 
 
-# --- 12. UI LOGIC ---
+# --- 13. GENERAL GRAPH ANSWER GENERATION ---
+def write_graph_answer(user_query: str, graph_data: str):
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a Professional Financial Analyst.\n"
+                        "- Use only the provided FACT CONTEXT and PATH CONTEXT.\n"
+                        "- FACT CONTEXT contains grounded triples.\n"
+                        "- PATH CONTEXT contains multi-hop graph traversal chains.\n"
+                        "- If the question asks about causes, drivers, relationships, or sequences, use PATH CONTEXT explicitly.\n"
+                        "- You may connect the dots only when the path itself supports the reasoning.\n"
+                        "- Do not invent facts.\n"
+                        "- If the answer is not supported by the graph evidence, say so clearly.\n"
+                        "- Preserve units exactly as given.\n"
+                        "- Be concise."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"{graph_data}\n\nQUESTION: {user_query}"
+                }
+            ]
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Generation failed: {e}"
+
+
+# --- 14. UI LOGIC ---
 st.set_page_config(page_title="GraphRAG Analyst", layout="wide")
 st.title("🍏 Apple 10-Q Graph Explorer")
 
@@ -733,10 +885,12 @@ if prompt := st.chat_input("Ask about Net Sales, Assets, Liabilities, drivers, o
                     "result_count": len(reasoning_result.get("results", [])) if reasoning_result.get("results") else 0
                 }
             else:
-                graph_data, rewritten, expanded_queries = get_grounded_context(prompt)
+                graph_data, rewritten, expanded_queries, selected_facts, selected_paths = get_grounded_context(prompt)
                 debug_info["mode"] = "standard_graph_rag_fallback"
                 debug_info["rewritten_query"] = rewritten
                 debug_info["expanded_queries"] = expanded_queries
+                debug_info["selected_facts"] = selected_facts
+                debug_info["selected_paths"] = selected_paths
 
                 if not graph_data:
                     response_text = (
@@ -745,34 +899,16 @@ if prompt := st.chat_input("Ask about Net Sales, Assets, Liabilities, drivers, o
                     )
                     evidence_text = None
                 else:
-                    completion = client.chat.completions.create(
-                        model="gpt-4o",
-                        temperature=0,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a Professional Financial Analyst.\n"
-                                    "- Use only the FACT CONTEXT provided.\n"
-                                    "- If the facts contain multiple dates, compare them only if clearly supported.\n"
-                                    "- If the answer is not supported by the facts, say so clearly.\n"
-                                    "- Be concise."
-                                )
-                            },
-                            {
-                                "role": "user",
-                                "content": f"FACT CONTEXT:\n{graph_data}\n\nQUESTION: {prompt}"
-                            }
-                        ]
-                    )
-                    response_text = completion.choices[0].message.content
+                    response_text = write_graph_answer(prompt, graph_data)
                     evidence_text = graph_data
 
         else:
-            graph_data, rewritten, expanded_queries = get_grounded_context(prompt)
+            graph_data, rewritten, expanded_queries, selected_facts, selected_paths = get_grounded_context(prompt)
             debug_info["mode"] = "standard_graph_rag"
             debug_info["rewritten_query"] = rewritten
             debug_info["expanded_queries"] = expanded_queries
+            debug_info["selected_facts"] = selected_facts
+            debug_info["selected_paths"] = selected_paths
 
             if not graph_data:
                 response_text = (
@@ -781,33 +917,8 @@ if prompt := st.chat_input("Ask about Net Sales, Assets, Liabilities, drivers, o
                 )
                 evidence_text = None
             else:
-                try:
-                    completion = client.chat.completions.create(
-                        model="gpt-4o",
-                        temperature=0,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a Professional Financial Analyst.\n"
-                                    "- Use only the FACT CONTEXT provided.\n"
-                                    "- Preserve units exactly as given.\n"
-                                    "- If the answer is not supported by the facts, say so clearly.\n"
-                                    "- If multiple periods appear, mention them clearly rather than merging them incorrectly.\n"
-                                    "- Be concise."
-                                )
-                            },
-                            {
-                                "role": "user",
-                                "content": f"FACT CONTEXT:\n{graph_data}\n\nQUESTION: {prompt}"
-                            }
-                        ]
-                    )
-                    response_text = completion.choices[0].message.content
-                    evidence_text = graph_data
-                except Exception as e:
-                    response_text = f"Generation failed: {e}"
-                    evidence_text = graph_data
+                response_text = write_graph_answer(prompt, graph_data)
+                evidence_text = graph_data
 
     assistant_payload = {
         "role": "assistant",
