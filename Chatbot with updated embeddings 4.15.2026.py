@@ -4,10 +4,11 @@ from neo4j import GraphDatabase
 from openai import OpenAI
 
 # --- 1. CONFIGURATION ---
-OPENAI_KEY = ""
-NEO4J_URI = ""
-NEO4J_USER = ""
-NEO4J_PWD = ""
+# This tells the app: "Go get the values I saved in the Streamlit vault"
+OPENAI_KEY = st.secrets["OPENAI_KEY"]
+NEO4J_URI = st.secrets["NEO4J_URI"]
+NEO4J_USER = st.secrets["NEO4J_USER"]
+NEO4J_PWD = st.secrets["NEO4J_PWD"]
 
 client = OpenAI(api_key=OPENAI_KEY)
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PWD))
